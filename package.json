@@ -1,0 +1,70 @@
+{
+  "name": "zama-skill",
+  "version": "1.0.1",
+  "description": "Zama Skill for Claude Code, Codex CLI, Cursor, and other AGENTS.md tools (Aider, Cline, Continue, Zed, Jules). One-shot installer for confidential smart contract workflows on Zama FHEVM v0.11.",
+  "type": "module",
+  "bin": {
+    "zama-skill": "bin/cli.js"
+  },
+  "files": [
+    ".claude/CLAUDE.md",
+    ".claude/skills",
+    ".agents",
+    ".cursor",
+    ".windsurfrules",
+    "AGENTS.md",
+    "bin"
+  ],
+  "scripts": {
+    "test": "node dev/smoke-test.js",
+    "prepublishOnly": "npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "author": "zunmax (https://github.com/zunmax)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zunmax/zama-skill.git"
+  },
+  "homepage": "https://github.com/zunmax/zama-skill#readme",
+  "bugs": {
+    "url": "https://github.com/zunmax/zama-skill/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "fhevm",
+    "zama",
+    "fhe",
+    "homomorphic-encryption",
+    "confidential-contracts",
+    "confidential-smart-contracts",
+    "solidity",
+    "smart-contracts",
+    "ethereum",
+    "claude",
+    "claude-code",
+    "claude-skill",
+    "anthropic",
+    "codex",
+    "codex-cli",
+    "cursor",
+    "cursor-rules",
+    "windsurf",
+    "windsurfrules",
+    "agents-md",
+    "aider",
+    "cline",
+    "continue",
+    "zed",
+    "jules",
+    "ai-agent",
+    "ai-skill",
+    "agent-skill",
+    "developer-tools",
+    "cli"
+  ]
+}

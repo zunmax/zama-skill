@@ -1,0 +1,13 @@
+dev/
+assets/
+CHANGELOG.md
+.gitignore
+.gitattributes
+.git/
+.github/
+node_modules/
+*.log
+.DS_Store
+*.local.json
+*.tgz
+.tmp-smoke/

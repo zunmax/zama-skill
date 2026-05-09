@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+bin/cli.js  text eol=lf
+dev/*.sh    text eol=lf
+
+*.svg binary
+*.png binary
+*.jpg binary

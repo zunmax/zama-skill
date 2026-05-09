@@ -1,0 +1,246 @@
+# FHEVM v0.11 - Windsurf rules
+
+Active when the workspace touches `@fhevm/solidity`, `@fhevm/hardhat-plugin`,
+`@fhevm/mock-utils`, `@zama-fhe/relayer-sdk` (legacy primitives),
+`@zama-fhe/sdk` (new high-level SDK v3+), `@zama-fhe/react-sdk` (new React
+hooks v3+), or `@openzeppelin/confidential-contracts`; declares
+`euint*` / `ebool` / `eaddress` / `externalEuint*`; inherits
+`ZamaEthereumConfig`; uses `ZamaSDK`, `Token`, `ReadonlyToken`,
+`RelayerWeb`, `RelayerNode`, `RelayerCleartext`, `ViemSigner`,
+`EthersSigner`, `WagmiSigner`, `WrappersRegistry`, `indexedDBStorage`,
+`chromeSessionStorage`, or any of the 59 React hooks (`useShield`,
+`useUnshield`, `useConfidentialBalance`, `useConfidentialTransfer`,
+`useAllow`, `useUserDecrypt`, `useDelegateDecryption`, `useActivityFeed`,
+etc.); or hits any FHEVM custom error (`SenderNotAllowed`, `ACLNotAllowed`,
+`InvalidKMSSignatures`, `KMSInvalidSigner`, `EmptyDecryptionProof`,
+`DivisionByZero`, `NotPowerOfTwo`, `HCUTransactionLimitExceeded`,
+`HCUTransactionDepthLimitExceeded`) or new-SDK error
+(`SigningRejectedError`, `NoCiphertextError`,
+`InsufficientConfidentialBalanceError`, `InsufficientERC20BalanceError`,
+`BalanceCheckUnavailableError`, `KeypairExpiredError`,
+`RelayerRequestFailedError`, `DelegationNotPropagatedError`,
+`DelegationCooldownError`).
+
+If none of the above applies, ignore this file.
+
+## What FHEVM is
+
+Contracts operate on opaque `bytes32` handles, not on ciphertexts. A coprocessor
+performs FHE math off-chain. `ebool` is a `bytes32` UDVT, so:
+
+- `if (ebool)` and `require(ebool)` are Solidity compile errors.
+- The trap is unwrapping (`ebool.unwrap(r) != bytes32(0)`); the handle is always
+  non-zero, so the check always passes. Use `FHE.select` for any branch on an
+  encrypted value.
+
+Every encrypted handle has an ACL. Missing `FHE.allowThis` loses the handle
+next transaction. Missing `FHE.allow(value, user)` makes user decryption
+revert with `SenderNotAllowed`.
+
+## Required setup
+
+```solidity
+pragma solidity ^0.8.28;
+import { FHE, euint64, externalEuint64, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { ZamaEthereumConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+contract MyContract is ZamaEthereumConfig { }
+```
+
+Pragma: `^0.8.28` (default). `^0.8.27` minimum when importing
+`@openzeppelin/confidential-contracts`. EVM target: `cancun`.
+
+## ALWAYS
+
+- Call `FHE.allowThis(value)` after every stored encrypted computation.
+- Call `FHE.allow(value, user)` for every value a user must decrypt.
+- Use `FHE.fromExternal(externalVal, inputProof)` for user-submitted inputs;
+  `FHE.asEuintXX(literal)` is plaintext-to-encrypted only.
+- Use `FHE.select` for branching on `ebool`; never `if` / `require` / `assert`.
+- Verify every function name, address, and import path against installed
+  source under `node_modules/@fhevm/solidity/` and
+  `node_modules/@zama-fhe/relayer-sdk/`. Source > skill references > Zama
+  docs > training knowledge. On conflict, source wins.
+
+## ASK FIRST (do not decide unilaterally)
+
+- Public vs user decryption (visibility model differs).
+- Encrypted bit width above `euint64` (HCU and gas cost rise sharply).
+- Replay protection on finalization functions.
+- ERC-7984 vs custom confidential ERC-20.
+
+## NEVER
+
+- `TFHE.*` - the library is `FHE`. `TFHE` does not compile.
+- `SepoliaConfig` as a Solidity base - removed in v0.9. Use
+  `ZamaEthereumConfig`. (The `SepoliaConfig` exported by
+  `@zama-fhe/relayer-sdk/web` is unrelated and still correct.)
+- `FHE.requestDecryption`, `GatewayCaller`, `FHE.verifySignatures` - removed
+  or renamed in v0.9. Public decryption is `makePubliclyDecryptable` ->
+  off-chain `publicDecrypt` -> on-chain `checkSignatures`.
+- `FHE.allowForDecryption(handle)` as a library helper - never existed.
+  Use `FHE.makePubliclyDecryptable(handle)`.
+- `FHE.neq` / `FHE.lte` / `FHE.gte` - use `FHE.ne` / `FHE.le` / `FHE.ge`.
+- `fhevmjs`, `@fhevm/sdk`, `@zama-ai/fhevm`, bare `fhevm` - deprecated or
+  never existed. Use `@zama-fhe/relayer-sdk` with `/web`, `/bundle`, or
+  `/node` sub-path.
+- Bare relayer-sdk import (`from '@zama-fhe/relayer-sdk'`) - subpath required.
+- `initFhevm()` - the function is `initSDK()` (browser only).
+- `results.values[handle]` - the field is `results.clearValues[handle]`.
+- `view` / `pure` on a function that calls FHE math, ACL grants,
+  `fromExternal`, `makePubliclyDecryptable`, `checkSignatures`, or
+  `randEuintX`. Those write coprocessor state and revert in `view`/`pure`.
+- Encrypted loop bound (`for (uint i = 0; i < euint64Val; i++)`) - compile
+  error. Fix the iteration count plaintext, gate work with `FHE.select`.
+- `FHE.div(x, y)` / `FHE.rem(x, y)` with an encrypted `y` - compile error.
+  Only `(euint*, uintN)` overload exists; runtime `FHE.div(x, 0)` reverts
+  with `DivisionByZero()`.
+- Signed encrypted types `eint8`-`eint256` - declared but unusable;
+  `@fhevm/solidity@0.11.1` ships zero `FHE.*` overloads.
+- Hardcoding ACL/KMS/Coprocessor addresses or relayer URLs - inherit from
+  `ZamaEthereumConfig`. Mainnet (chain 1) needs `MainnetConfig` on the
+  frontend SDK side; never `SepoliaConfig` on chain 1.
+- Mainnet API key in `NEXT_PUBLIC_*` / `VITE_*` - it ships to every
+  visitor. Route through a backend proxy with `relayerRouteVersion: 1`.
+- `userDecryptEbool(FhevmType, ...)` / `userDecryptEaddress(FhevmType, ...)`
+  in Hardhat tests - only `userDecryptEuint` takes `FhevmType`.
+
+## Hard limits (source-verified)
+
+- `userDecrypt`: total ciphertext width <= 2048 bits per call (`check2048EncryptedBits`),
+  <= 10 contract addresses (`MAX_USER_DECRYPT_CONTRACT_ADDRESSES`), <= 365-day
+  EIP-712 grant (`MAX_USER_DECRYPT_DURATION_DAYS`).
+- Per transaction: 20M HCU total, 5M sequential-depth HCU
+  (`HCULimit.sol:50, 54`).
+- Encrypted-input batch: <= 2048 bits, <= 256 variables.
+- `FHE.randEuintX(upperBound)` - `upperBound` MUST be a power of 2.
+- `userDecryptEuint*` returns `Promise<bigint>` - in tests compare with
+  `1000n`, never `1000` (chai `.eq` does strict `===`).
+
+## Encrypt + decrypt quick reference
+
+Verified against `@zama-fhe/sdk@3.0.0`, `@zama-fhe/react-sdk@3.0.0`, `@fhevm/hardhat-plugin@0.4.2`, and the official guide https://docs.zama.org/protocol/sdk/guides/encrypt-decrypt.md.
+
+```ts
+/* Encrypt user input (browser, React; "use client" in Next.js) */
+import { useEncrypt } from "@zama-fhe/react-sdk";
+const { mutateAsync: encrypt } = useEncrypt();
+const { handles, inputProof } = await encrypt({
+  values: [{ value: 1000n, type: "euint64" }],
+  contractAddress, userAddress,
+});
+
+/* Encrypt user input (Hardhat test) */
+import { fhevm } from "hardhat";
+const inp = fhevm.createEncryptedInput(contract.address, signer.address);
+inp.add64(1000n);
+const enc = await inp.encrypt();   /* enc.handles[0], enc.inputProof */
+
+/* Decrypt confidential token balance (one EIP-712 prompt, then silent) */
+const balance = await token.balanceOf();              /* returns bigint, NOT a wrapper */
+const handle  = await token.confidentialBalanceOf();  /* raw bytes32 handle (Hex) */
+import { useConfidentialBalance, useConfidentialBalances } from "@zama-fhe/react-sdk";
+const { data } = useConfidentialBalance({ tokenAddress: cUSDT }, { refetchInterval: 5000 });
+
+/* Decrypt arbitrary handles from a custom (non-token) contract */
+await sdk.allow([contract.address]);
+const values = await sdk.userDecrypt([{ handle, contractAddress: contract.address }]);
+const cleartext = values[handle];                     /* bare Record - NOT .clearValues */
+import { useAllow, useIsAllowed, useUserDecrypt } from "@zama-fhe/react-sdk";
+
+/* Local development: cleartext mode (NOT allowed on chain 1 / 11155111) */
+import { RelayerCleartext, hardhatCleartextConfig, hoodiCleartextConfig } from "@zama-fhe/sdk/cleartext";
+const relayer = new RelayerCleartext(hardhatCleartextConfig);
+
+/* Delegated decryption (decrypt someone else's balance) */
+await token.delegateDecryption({ delegateAddress, expirationDate: Math.floor(Date.now()/1000) + 3600 });
+/* Wait 1-2 minutes for gateway propagation, else DelegationNotPropagatedError */
+const otherBal = await token.decryptBalanceAs(otherAddress, delegateAddress);
+```
+
+Pitfalls: `userDecrypt` returns bare `Record`, `publicDecrypt` returns `{ clearValues }`. `NoCiphertextError` = "never shielded" (show empty state, NOT "0"). COOP `same-origin` + COEP `require-corp`. Vite: `optimizeDeps.exclude: ["@zama-fhe/relayer-sdk"]` + `worker.format: "es"`. Mainnet: backend proxy with `x-api-key`, never `NEXT_PUBLIC_*` / `VITE_*`. `keypairTTL` default 30d, max 365d, `0` rejected at `ZamaSDK` construction.
+
+## Public decryption is a 3-step flow
+
+1. On-chain: `FHE.makePubliclyDecryptable(handle)`.
+2. Off-chain: `await instance.publicDecrypt([handle])`, read
+   `results.clearValues[handle]`.
+3. On-chain: `FHE.checkSignatures(cts, abi.encode(clearValue), proof)` where
+   `cts` order matches the off-chain `publicDecrypt` argument order. Swapping reverts with `KMSInvalidSigner(address)`.
+
+## Browser
+
+The SDK uses WASM with `SharedArrayBuffer`. Serve with
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`. With Vite, exclude the SDK
+from `optimizeDeps` and set `worker.format: "es"` or WASM fails to load.
+
+Next.js / Remix: relayer SDK + Wagmi persistent storage both need
+`indexedDB`, which does not exist during SSR. Mark the file
+`"use client"` and gate `initSDK` / `createInstance` behind `useEffect`.
+
+## Post-delivery checks (zero matches required)
+
+```
+Solidity: requestDecryption|SepoliaConfig|GatewayCaller|TFHE\.|FHE\.allowForDecryption\(|FHE\.neq\(|FHE\.lte\(|FHE\.gte\(|verifySignatures|zama\.cloud|FHE\.randBounded\(
+Frontend: from '@zama-fhe/relayer-sdk'[^/]|initFhevm|@fhevm/sdk|fhevmjs|results\.values\[|zama\.cloud
+Hardhat:  userDecryptEbool\(FhevmType|userDecryptEaddress\(FhevmType|fhevmjs
+Style:    ^\s*//[^\*]|^\s*///|[\x{2013}\x{2014}\x{1F680}\x{26A0}]
+```
+
+Run the mechanical lint as a second gate; a non-zero exit blocks delivery:
+
+```bash
+node .agents/skills/zama-skill/scripts/fhe-lint.js <path>
+# exit 0 clean, 1 DEFINITE, 2 LIKELY only
+```
+
+## Detail lives in `.agents/`
+
+The Windsurf install ships the agent-agnostic skill bundle alongside this
+file. Load on demand from `.agents/skills/zama-skill/`:
+
+- `references/anti-patterns.md` - 62 verified mistakes (always read before
+  writing FHEVM code in a new session).
+- `references/types-operations.md` - encrypted operations table, HCU costs,
+  budgeting heuristics.
+- `references/acl.md` - ACL API and grant patterns.
+- `references/inputs-decryption.md` - input proofs, public decrypt 3-step
+  flow, user decrypt EIP-712 flow with hard limits.
+- `references/frontend.md` - relayer SDK, COOP/COEP, mainnet API-key auth +
+  backend proxy.
+- `references/testing.md` - Hardhat plugin patterns.
+- `references/deployment.md` - Sepolia / mainnet deploy.
+- `references/fhe-vulnerabilities.md` - 32 FHE patterns (P1-P32).
+- `references/solidity-vulnerabilities.md` - 29 general Solidity vectors
+  (G1-G29).
+- `templates/` - working ConfidentialERC20, PrivateVoting, SealedAuction.
+- `scripts/fhe-lint.js` - the mechanical lint above.
+
+New-SDK references (`@zama-fhe/sdk@^3.0.0` + `@zama-fhe/react-sdk@^3.0.0`):
+
+- `references/zama-sdk-overview.md` - package map, `ZamaSDK` constructor,
+  network presets, when to choose new vs legacy SDK.
+- `references/zama-sdk-auth-storage.md` - backend proxy + 3 `auth` shapes +
+  CSRF, `RelayerWeb` / `RelayerNode` / `RelayerCleartext`, signer adapters,
+  storage adapters, web extensions.
+- `references/zama-sdk-tokens.md` - `Token` / `ReadonlyToken`, shield /
+  unshield (resumable two-phase) / confidentialTransfer / balanceOf,
+  batch decrypt, operator approvals.
+- `references/zama-sdk-session.md` - session model (`keypairTTL` /
+  `sessionTTL`), `allow` / `userDecrypt` / `revokeSession`, full
+  delegated decryption API.
+- `references/zama-sdk-react.md` - `ZamaProvider`, 59 React hooks
+  (TanStack Query), Next.js SSR, Vite, `zamaQueryKeys` cache control.
+- `references/zama-sdk-errors.md` - 26 error classes (`ZamaError` base + 25 subclasses), `matchZamaError`
+  pattern, recovery flows, "no balance" vs "zero balance".
+- `references/zama-sdk-activity.md` - activity feed pipeline, token + ACL
+  event decoders, `WrappersRegistry`, contract builders, operator
+  approvals, FHE artifact cache.
+
+The new SDK is a superset on top of the legacy `@zama-fhe/relayer-sdk`. The
+contract toolchain (`@fhevm/mock-utils@0.4.2`,
+`@fhevm/hardhat-plugin@0.4.2`) peer-pins `@zama-fhe/relayer-sdk@0.4.1`
+exact, while `@zama-fhe/sdk@3.0.0` declares `~0.4.2`. Installing both
+yields a peer warning; if the lockfile hoists `0.4.2` the toolchain
+runtime-aborts - pin `@zama-fhe/relayer-sdk: 0.4.1` in `package.json`
+`overrides` to force `0.4.1` to win. New SDK requires `node >= 22`.

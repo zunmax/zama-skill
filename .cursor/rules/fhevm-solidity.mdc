@@ -1,0 +1,441 @@
+---
+description: "Zama FHEVM Solidity development, review, and audit. Applies to .sol files that import @fhevm/solidity (or @openzeppelin/confidential-contracts); declare encrypted types (euint*, ebool, eaddress, externalEuint*); call FHE.* operations or ACL helpers; or inherit ZamaEthereumConfig. Triggers on FHEVM audit / security review requests, confidential ERC-20 / ERC-7984 work, and the runtime custom errors SenderNotAllowed, ACLNotAllowed, SenderNotAllowedToUseHandle, InvalidInputHandle, EmptyInputProof, DeserializingInputProofFail, InvalidKMSSignatures, KMSInvalidSigner, EmptyDecryptionProof, DivisionByZero, NotPowerOfTwo, ZamaProtocolUnsupported, HCUTransactionLimitExceeded, HCUTransactionDepthLimitExceeded."
+globs: ["**/*.sol"]
+alwaysApply: false
+---
+
+# FHEVM Solidity Rules (v0.11)
+
+This rule set targets `@fhevm/solidity@0.11.1` (Solidity Guides v0.11 on docs.zama.org). Generated code assumes v0.11. Pre-v0.11 patterns (`TFHE.*`, `requestDecryption`, `SepoliaConfig` as Solidity base, `neq`/`lte`/`gte`) are flagged for migration. v0.11-specific identifiers to know: `IERC7984ERC20Wrapper` interface ID `0x1f1c62b2`, `inferredTotalSupply()` (replaces v0.10 `totalSupply()`), `UnwrapRequested` / `UnwrapFinalized` events carry `bytes32 indexed unwrapRequestId`.
+
+Contracts operate on opaque `bytes32` handles - a coprocessor does FHE computation off-chain.
+You CANNOT branch on encrypted values: `ebool` is a `bytes32` UDVT, so `require(ebool)` and `if (ebool)` are Solidity compile errors. The bug to flag is when a dev unwraps the handle to a primitive (`ebool.unwrap(r) != bytes32(0)`) - the non-zero handle always passes.
+
+## Setup
+
+```solidity
+pragma solidity ^0.8.28;
+import { FHE, euint64, externalEuint64, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { ZamaEthereumConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+contract MyContract is ZamaEthereumConfig { }
+```
+
+### Pragma Policy
+
+| Case | Pragma |
+|---|---|
+| Default for new contracts | `^0.8.28` (matches reference template, `hardhat.config.ts` uses `version: "0.8.28"`) |
+| Importing `@openzeppelin/confidential-contracts` (ERC-7984) | `^0.8.27` minimum (`ERC7984.sol` declares `^0.8.27`) |
+| Absolute minimum for FHEVM | `^0.8.24` (only if a dependency pins lower) |
+
+EVM target: `"cancun"`. Do not target a lower EVM version.
+
+## ALWAYS / ASK FIRST / NEVER
+
+**ALWAYS**:
+- Read `.cursor/references/anti-patterns.md` before writing FHEVM code
+- Call `FHE.allowThis()` after every stored encrypted computation
+- Call `FHE.allow(result, user)` for values users need to decrypt
+- Use `ZamaEthereumConfig`, `FHE.fromExternal()`, `FHE.select()`
+- Run 2-layer verification (references + installed source) on every technical value. Trust hierarchy: source > `.cursor/references/` > Zama docs > training knowledge. If layers conflict, source wins.
+- Grep output for deprecated patterns before delivering
+
+**ASK FIRST** (do not decide unilaterally):
+- Public decrypt vs user decrypt (visibility model differs)
+- Encrypted integer width above `euint64` (HCU/gas cost rises sharply)
+- Replay protection on finalization functions
+- ERC-7984 standard vs custom confidential ERC-20
+
+**NEVER**:
+- `TFHE.*`, `SepoliaConfig` in Solidity, `requestDecryption`, `GatewayCaller`, `verifySignatures` - all removed/renamed in v0.9. (`FHE.allowForDecryption` never existed as a library helper; use `FHE.makePubliclyDecryptable`. The host-contract API `IACL.allowForDecryption(bytes32[])` does still exist; `makePubliclyDecryptable` wraps it for the single-handle path.)
+- `FHE.neq` / `lte` / `gte` - use `ne` / `le` / `ge`
+- `fhevmjs`, `@fhevm/sdk`, `@zama-ai/fhevm`, or bare `fhevm` imports
+- `require(FHE.le(...))` or any `if`/`assert` on an FHE result - compile error (no auto-bool); bug to flag is unwrap-then-check (handle is always non-zero, check always passes)
+- `FHE.asEuintXX(external, proof)` for user input - use `FHE.fromExternal`
+- `FHE.div` / `FHE.rem` with an encrypted divisor - hard revert
+- Signed `eint8`-`eint256` types - declared only as enum, not as Solidity types
+
+## Dependencies
+
+| Package | npm Name | Required |
+|---------|----------|----------|
+| Hardhat | `hardhat` (`^2.28.6`) | always (pin v2 explicitly; bare `npm install hardhat` resolves v3 and breaks) |
+| Solidity lib | `@fhevm/solidity` (`^0.11.1`) | always |
+| Hardhat plugin | `@fhevm/hardhat-plugin` (`^0.4.2`) | always (peers `hardhat ^2.0.0` only; the `^2.28.6` floor is the template's choice, not the plugin's peer) |
+| Mock utils | `@fhevm/mock-utils` (`^0.4.2`) | always (peers `@zama-fhe/relayer-sdk` exactly `0.4.1`) |
+| Relayer SDK | `@zama-fhe/relayer-sdk` (`0.4.1` exact, no caret) | always (`@fhevm/hardhat-plugin` runtime-aborts on version drift) |
+| Hardhat-ethers | `@nomicfoundation/hardhat-ethers` (`^3.1.3`) | always (NOT `^4.x` - that requires Hardhat 3) |
+| Hardhat verify | `@nomicfoundation/hardhat-verify` (`^2.1.3`) | always |
+| Chai matchers | `@nomicfoundation/hardhat-chai-matchers` (`^2.1.2`) | always |
+| Network helpers | `@nomicfoundation/hardhat-network-helpers` (`^1.1.2`) | opt-in (only if tests use `time.increase` / `mine` / `loadFixture` / snapshots; v3 requires Hardhat 3) |
+| OZ Confidential | `@openzeppelin/confidential-contracts` (`^0.4.0`) | opt-in (only when using ERC-7984 confidential tokens) |
+| hardhat-deploy | `hardhat-deploy` (`^0.11.45`) | Path B only (NOT `^0.12` or `^2.0`) |
+
+Banned (deprecated or never existed): `fhevmjs`, `@fhevm/sdk`, `@zama-ai/fhevm`, bare `fhevm`.
+
+Peer-dep caveat (only matters when installing the new SDK in the same project as the contract toolchain): `@zama-fhe/sdk@3.0.0` declares `@zama-fhe/relayer-sdk: ~0.4.2` as a regular dep, while `@fhevm/hardhat-plugin@0.4.2` and `@fhevm/mock-utils@0.4.2` peer-pin `0.4.1` exact. The toolchain runtime-aborts if `0.4.2` wins resolution - pin `@zama-fhe/relayer-sdk: 0.4.1` in `package.json` `overrides`.
+
+## Verification Protocol
+
+Every technical value must be 2-layer verified before writing code:
+1. Check reference files in `.cursor/references/`
+2. Verify against actual source code (npm types, function signatures)
+
+If they conflict -> source code wins. Do not assume function names from memory - grep first.
+
+## Input Handling
+
+User-submitted encrypted values arrive as `externalEuintXX` + `bytes calldata inputProof`.
+Convert with `FHE.fromExternal(encAmount, inputProof)` - this verifies the ZK proof.
+`FHE.asEuint64(42)` converts a Solidity literal, NOT user-submitted inputs.
+
+## ACL - Required After Every Stored Computation
+
+- `FHE.allowThis(result)` - contract keeps access in future transactions
+- `FHE.allow(result, user)` - user can decrypt their own data
+- `FHE.allowTransient(result, target)` - cross-contract access within same tx
+
+Without `allowThis`, the contract reverts with `SenderNotAllowed(address)` (custom error from `@fhevm/host-contracts/contracts/ACL.sol:106`) on the next transaction.
+
+## Encrypted Conditionals
+
+```solidity
+/* WRONG - Solidity compile error: ebool is bytes32 UDVT, no implicit bool conversion */
+require(FHE.le(amount, balance));
+
+/* CORRECT */
+ebool hasEnough = FHE.le(amount, balance);
+euint64 newBal = FHE.select(hasEnough, FHE.sub(balance, amount), balance);
+```
+
+## Comparison Names (exact - alternatives do not compile)
+
+`FHE.ne()` not `neq()` | `FHE.le()` not `lte()` | `FHE.ge()` not `gte()`
+
+## Public Decryption (3-step, dApp-driven)
+
+1. `FHE.makePubliclyDecryptable(handle)` - permanent, irreversible
+2. Off-chain: relayer SDK `publicDecrypt([handle])` -> `results.clearValues[handle]`
+3. `FHE.checkSignatures(bytes32[] cts, bytes cleartexts, bytes proof)` - handle order must match step 2
+
+## Types
+
+| Type | Arithmetic | Comparison | Notes |
+|------|-----------|------------|-------|
+| ebool | - | eq, ne | and/or/xor/not, select, rand |
+| euint8-128 | full (div/rem plaintext-only) | full | select, rand, neg, not, bitwise, shift/rotate |
+| eaddress | - | eq, ne | select only (no arithmetic, no ordering) |
+| euint160 | - | - | declared in `encrypted-types/EncryptedTypes.sol` but `@fhevm/solidity@0.11.1` exposes ZERO `FHE.*` overloads; any operation fails with `Member "<op>" not found ... after argument-dependent lookup`. Use `eaddress` for 160-bit values. |
+| euint256 | - | eq, ne | bitwise, shift/rotate, select, neg, not, rand |
+| eint8-eint256 | declared, no ops | declared, no ops | declared as `bytes32` types in `encrypted-types/EncryptedTypes.sol` so a bare `eint64 x;` compiles; `@fhevm/solidity@0.11.1` ships zero `FHE.*` overloads, so the first call fails with `Member "<op>" not found ... after argument-dependent lookup` |
+
+## Quick Reference: Encrypted Operations
+
+| Operation | Function | Types | Notes |
+|-----------|----------|-------|-------|
+| Add | `FHE.add(a, b)` | euint8-128 | Wraps on overflow |
+| Subtract | `FHE.sub(a, b)` | euint8-128 | Wraps on underflow |
+| Multiply | `FHE.mul(a, b)` | euint8-128 | Expensive HCU |
+| Divide | `FHE.div(a, plaintext)` | euint8-128 | Plaintext RHS ONLY |
+| Compare eq | `FHE.eq(a, b)` | all | Returns ebool |
+| Compare ne | `FHE.ne(a, b)` | all | NOT neq |
+| Compare le | `FHE.le(a, b)` | euint8-128 | NOT lte |
+| Compare lt | `FHE.lt(a, b)` | euint8-128 | |
+| Compare ge | `FHE.ge(a, b)` | euint8-128 | NOT gte |
+| Compare gt | `FHE.gt(a, b)` | euint8-128 | |
+| Conditional | `FHE.select(cond, a, b)` | all | Encrypted ternary |
+| Random | `FHE.randEuintX()` | all euint | On-chain RNG |
+| Min/Max | `FHE.min/max(a, b)` | euint8-128 | |
+| Bitwise | `FHE.and/or/xor/not` | all except eaddress | |
+| Shift | `FHE.shl/shr/rotl/rotr` | euint8-256 | Modulo bit width |
+
+## Deprecated - Never Use in Solidity
+
+| Wrong | Correct | Why |
+|-------|---------|-----|
+| `SepoliaConfig` (Solidity base) | `ZamaEthereumConfig` | Removed as Solidity base in v0.9. The same name in the relayer SDK (TS const) is unrelated and still correct. |
+| `FHE.asEuint64(ext, proof)` | `FHE.fromExternal(ext, proof)` | asEuint converts literals only |
+| `FHE.requestDecryption()` | 3-step self-relaying | Removed in v0.9 |
+| `TFHE.add()` | `FHE.add()` | TFHE is the Rust lib name |
+| `GatewayCaller` | `ZamaEthereumConfig` | Removed in v0.9 |
+| `FHE.verifySignatures()` | `FHE.checkSignatures()` | Renamed in v0.9 |
+| `FHE.allowForDecryption()` | `FHE.makePubliclyDecryptable()` | Never existed as a library helper. `IACL.allowForDecryption(bytes32[])` does exist on the host ACL contract; `makePubliclyDecryptable` wraps it for the single-handle path. |
+
+---
+
+## Workflow: Generate Contract
+
+When the user asks to create a new FHEVM contract:
+
+1. **Tier 1 preload** -> `.cursor/references/anti-patterns.md` (always) + `.cursor/references/code-style.md`.
+2. **Determine use case** (token, voting, auction, access control, custom). Pick the matching template from `.cursor/templates/` (`ConfidentialERC20.sol`, `PrivateVoting.sol`, `SealedAuction.sol`) when available.
+3. **Tier 2 preload on demand** -> `types-operations.md`, `acl.md`, `inputs-decryption.md`, `erc7984.md` as the feature requires.
+4. **Write the contract**, enforcing the ALWAYS / NEVER rules above on every line; cite the rule number when making non-obvious choices.
+5. **Deliver only after** the Self-Review Checklist and Post-Delivery Grep below both return zero failures.
+
+## Workflow: Review Contract
+
+When the user asks to review existing FHEVM code:
+
+1. **Tier 1 preload** -> Read `.cursor/references/anti-patterns.md` (all verified mistakes, auto-loads on every review)
+2. **Phase 1 - Static Scan** (for each function):
+   - Trace all encrypted value flows (creation -> operation -> storage)
+   - Verify ACL: every stored value has `allowThis()`, every user value has `allow()`
+   - Check: no branching on encrypted values (`require`/`if`/`assert`)
+   - Check: all external inputs use `fromExternal()`, not `asEuintXX()`
+   - Check: comparison functions use correct names (`ne` not `neq`, `le` not `lte`)
+   - Scan for all documented anti-patterns
+3. **Phase 2 - Logic Analysis**:
+   - Can any operation overflow? Is it guarded with `FHE.select`?
+   - Can any division have an encrypted divisor?
+   - Are `checkSignatures` handle orders consistent with `publicDecrypt` order?
+   - Are there uninitialized handles being used in operations?
+4. **Phase 3 - 2-Layer Verify** every candidate finding against installed source (`node_modules/@fhevm/solidity/lib/FHE.sol`). Reject findings that Layer 2 disproves.
+5. **Phase 4 - Classify with three tags**. Every finding carries:
+   - **Confidence** (0-100): `DEFINITE BUG` (>=95), `LIKELY ISSUE` (80-94), `PROBABLE ISSUE` (70-79), `SUGGESTION` (40-69), `NOTE` (<40)
+   - **Severity** (impact-based): `Critical` (funds/lockup/confidentiality breach), `High`, `Medium`, `Low`, `Info`
+   - **Remark** (reviewer judgement): `Exploitable`, `Needs Review`, `Design Choice`, `False Positive`, `Hardening`
+6. **Phase 5 - Output** as a Findings Summary table with columns: `# | Severity | Confidence | Category | Location | Remark | Title` - sort by Severity (Critical -> Info) then Confidence desc. Each finding detail carries a header line `Severity - Confidence N - Remark`. Include fix diff when Confidence >= 80; otherwise a one-line Suggested Mitigation.
+
+## Workflow: Deploy Contract
+
+When the user asks to deploy, set up a project, or configure deployment:
+
+1. **Tier 1 preload** -> `.cursor/references/anti-patterns.md` (config mistakes #22a and #23-#25).
+2. **Tier 2 preload** -> `.cursor/references/environment.md` and `.cursor/references/deployment.md`.
+3. Framework is Hardhat. Two deploy patterns:
+   - Path A (default): `npx hardhat run scripts/deploy.ts --network <net>`. Template https://github.com/zunmax/fhevm-template.
+   - Path B: `hardhat-deploy@^0.11.45` plugin. Same template (https://github.com/zunmax/fhevm-template) ships `contracts/deploy/deploy.ts`; run with `npx hardhat deploy --network <net>`.
+4. Required pins: `hardhat@^2.28.6` (pin v2 explicitly - bare `npm install hardhat` resolves v3 and breaks; the plugin itself only peers `hardhat ^2.0.0`), `@fhevm/hardhat-plugin@^0.4.2`, `@fhevm/mock-utils@^0.4.2`, `@zama-fhe/relayer-sdk@0.4.1` (EXACT, no caret - mock-utils peers it that way and the plugin runtime-aborts on drift), `@nomicfoundation/hardhat-ethers@^3.1.3`, `@nomicfoundation/hardhat-chai-matchers@^2.1.2`, `@nomicfoundation/hardhat-network-helpers@^1.1.2` (opt-in), `hardhat-deploy@^0.11.45` (Path B). Do NOT install `hardhat-deploy@^0.12`, `hardhat-deploy@^2.0`, `@nomicfoundation/hardhat-ethers@^4.x`, or `@nomicfoundation/hardhat-network-helpers@^3.x`: all require Hardhat 3.
+5. Compiler: Solidity `0.8.28`, `evmVersion: "cancun"`, optimizer `runs: 800`. Bump pragma to `^0.8.27`+ if importing `@openzeppelin/confidential-contracts`.
+6. Config: `.env` via `dotenv` (`PRIVATE_KEY`, `RPC_URL`, `ETHERSCAN_API_KEY`). Etherscan v2 uses a single `apiKey` string.
+7. Write deploy script matching the chosen path. Persist address + ABI to `deployments/<network>/<Contract>.json`.
+8. Grep output for anti-patterns #22a (missing version pin) and #23-#25 (wrong relayer URL, v0.8 addresses, hardcoded config).
+9. Run the deployment checklist from `deployment.md` before delivering.
+
+## Workflow: Security Audit
+
+When the user says "audit", "security review", "deep review", or "full review":
+
+**Orchestrated mode (preferred, when the harness supports parallel sub-agents):** spawn 7 specialized hacking modules in parallel, each reading its bundle of source + module-specific instructions. The 7 bundles live under `.cursor/review-modules/` paired with `.cursor/references/`:
+
+| Bundle | Files (appended in order) |
+|--------|---------------------------|
+| `module-1-bundle.md` | `references/fhe-vulnerabilities.md` + `review-modules/encrypted-state-flow.md` + `review-modules/audit-protocol.md` |
+| `module-2-bundle.md` | `review-modules/acl-completeness.md` + `review-modules/audit-protocol.md` |
+| `module-3-bundle.md` | `review-modules/decryption-integrity.md` + `review-modules/audit-protocol.md` |
+| `module-4-bundle.md` | `review-modules/type-operation-safety.md` + `review-modules/audit-protocol.md` |
+| `module-5-bundle.md` | `review-modules/confidentiality-boundary.md` + `review-modules/audit-protocol.md` |
+| `module-6-bundle.md` | `review-modules/fhe-logic-invariant.md` + `review-modules/audit-protocol.md` |
+| `module-7-bundle.md` | `references/solidity-vulnerabilities.md` + `review-modules/solidity-security.md` + `review-modules/audit-protocol.md` |
+
+After all modules report, deduplicate by `group_key = Contract | function | vulnerability-class`, gate-evaluate per `finding-validation.md`, and emit one report per `report-format.md` with the ACL Coverage Matrix.
+
+**Single-agent mode (when parallel spawning is unavailable):**
+
+1. **Tier 1 preload** -> `.cursor/references/fhe-vulnerabilities.md` (32 FHE patterns P1-P32) + `.cursor/references/solidity-vulnerabilities.md` (29 Solidity patterns G1-G29)
+2. **Tier 2 preload** -> `.cursor/references/finding-validation.md` (4-gate scoring) + `.cursor/references/report-format.md` (output template)
+3. **Scan each in-scope `.sol` file** against all 61 patterns. Category map:
+   - FHE-specific (P1-P32): Encrypted State Corruption (P1-P5), ACL Permission Gaps (P6-P10), Decryption Flow (P11-P14), Type System Violations (P15-P19), Confidentiality Boundary (P20-P23), Cross-Contract Risks (P24-P27), Logic Errors (P28-P32). Full descriptions in `fhe-vulnerabilities.md`.
+   - General Solidity (G1-G29): Reentrancy (G1-G3), Access Control (G4-G7), Token Integration (G8-G12), Math / Precision (G13-G18), Execution Flow (G19-G22), Proxy / Upgrade (G23-G25), Economic / Oracle (G26-G29). Full descriptions in `solidity-vulnerabilities.md`.
+4. **Validate every candidate finding** through the 4 gates in `finding-validation.md`: Refutation, Reachability, Trigger, Impact.
+5. **Tag each finding** with Confidence (0-100), Severity, Remark as defined above. Confidence >= 80 gets description + fix diff; below 80 gets description only.
+6. **Emit report** per `report-format.md`, including the ACL Coverage Matrix.
+
+---
+
+## FHE Security Checklist (Quick Review)
+
+When reviewing FHEVM contracts, check these FHE-specific vulnerability categories:
+
+**State Corruption:**
+- Self-transfer inflation: when `from == to`, second balance write overwrites first -> tokens created from nothing. Guard: `require(from != to)`.
+- Stale handle: local variable holds old handle after storage is updated -> operations use outdated state.
+- Uninitialized handle: `FHE.add(uninitializedHandle, amount)` silently creates encrypted zero -> masks missing initialization.
+
+**ACL Gaps:**
+- Missing `allowThis()` after ANY stored encrypted computation -> revert `SenderNotAllowed(address)` (custom error from `ACL.sol:106`) in the next tx.
+- Missing `allow(user)` for user-facing values -> user cannot decrypt their own balance/vote/bid.
+- `allowTransient()` used for stored values -> ACL expires at tx end, contract fails next tx.
+- ACL calls skipped on early return or error paths.
+
+**Confidentiality Leaks:**
+- `require(FHE.le(a, b))` - Solidity compile error (`ebool` is `bytes32` UDVT, no auto-bool conversion); the bug is when a dev unwraps the handle to a primitive and gates on non-zero (always passes; provides zero protection).
+- Decrypted values in event parameters -> on-chain observers see private data.
+- Asymmetric `FHE.select` branches (different gas cost) -> gas-based side channel.
+- Plaintext `uint256` allowances in contracts with encrypted balances -> allowance amounts visible.
+
+**Logic Errors:**
+- Both `FHE.select` branches must maintain conservation laws (failed transfer = zero-sum, not skipped).
+- FHE arithmetic wraps silently on overflow - unlike Solidity 0.8+ checked math. Guard with `FHE.le()` + `FHE.select()`.
+- Handle ordering in `checkSignatures` must match `publicDecrypt` order exactly (cryptographically binding).
+
+## Source-Code Gotchas
+
+- `FHE.select(cond, euint8, euint64)` FAILS - requires exact same type (unlike add which auto-upcasts)
+- `FHE.allowThis(uninitializedHandle)` silently creates encrypted zero - guard with `isInitialized()`
+- `fromExternal()` grants TRANSIENT ACL only to the CALLING CONTRACT (verified: `Impl.sol:670-674` and `FHEVMExecutor.sol:713-727` both call `acl.allowTransient(result, msg.sender)` where `msg.sender` resolves to the contract). The user EOA gets NO ACL automatically. Always follow with `FHE.allowThis(handle)` for cross-tx contract use, and `FHE.allow(handle, msg.sender)` if the user must decrypt it back.
+- `FHE.div(x, 0)` reverts with the custom error `DivisionByZero()` raised by `FHEVMExecutor` (NOT `Panic(0x12)` - that is the plain-Solidity 0.8+ panic). Only `(euint*, uintN)` plaintext-divisor overloads exist; passing an encrypted divisor is a compile error (`Member "div" not found ... after argument-dependent lookup`).
+- Bounded random: `upperBound` MUST be power of 2 - `FHE.randEuint32(100)` reverts with `NotPowerOfTwo()`
+- `euint160` has ZERO FHE functions - use `eaddress` for 160-bit encrypted values
+
+---
+
+## Code Style (enforced on every Solidity file)
+
+Match the documentation style of OpenZeppelin, Uniswap, and Solady. A
+reviewer should understand every non-obvious decision from the NatSpec
+alone.
+
+- **No `//` or `///`.** All comments are `/* */` or NatSpec `/** */`. Never
+  `///` triple-slash, even though NatSpec accepts it.
+- **No em or en dashes.** U+2014 (EM DASH) and U+2013 (EN DASH) are banned
+  everywhere. Use hyphen, colon, comma, parentheses, or rephrase.
+- **File header** - open every `.sol` with:
+
+  ```solidity
+  /* SPDX-License-Identifier: MIT */
+  pragma solidity ^0.8.28;
+
+  /**
+   * @file MyContract.sol
+   * @description One-line purpose. Terse, factual.
+   */
+  ```
+
+- **Section dividers** are asterisk-bordered box comments, one line each:
+
+  ```solidity
+  /*************** Internal ***************/
+  /*************** Public Decryption - 3-Step Self-Relaying ***************/
+  /*************** Storage Layout ***************/
+  ```
+
+  At least 10 leading and 10 trailing `*`, Title Case label.
+
+- **Contract-level NatSpec** uses the full industry tag set:
+
+  ```solidity
+  /**
+   * @title ConfidentialERC20
+   * @author YourOrg
+   * @notice Minimal confidential ERC-20 with encrypted balances.
+   * @dev Balances are encrypted euint64 handles. Overflow wraps silently
+   *      in FHE arithmetic; transfers route through FHE.le + FHE.select.
+   * @custom:security-contact security@yourorg.example
+   */
+  contract ConfidentialERC20 is ZamaEthereumConfig { }
+  ```
+
+- **Function-level NatSpec** - every `external` / `public` function. Use:
+  `@notice` (user-facing), `@dev` (invariants, preconditions, gas / HCU,
+  design notes), `@param` (one per parameter), `@return` (one per
+  returned value), `@inheritdoc ParentName` when implementing an interface
+  (preferred over duplicating `@notice`).
+- **NatSpec is Solidity-only.** The tags above (`@notice`, `@dev`,
+  `@inheritdoc`, `@title`, `@custom:*`) are parsed by the Solidity
+  compiler and tools like `solidity-docgen`. They are NOT valid JSDoc
+  and must never appear in `.ts` / `.tsx` / `.js` / `.jsx` files - those
+  use JSDoc (see `fhevm-frontend.mdc` / `fhevm-testing.mdc` for TS rules).
+- **Inline comments** explain WHY, not WHAT. Spend them on FHE constraints:
+  handle-order requirements, transient vs persistent ACL, `allowThis`
+  lifecycle, overflow-wrap assumptions, power-of-2 random bounds.
+
+Post-code style grep (zero matches required):
+
+```
+Comments: ^\s*//[^\*]|^\s*///
+Glyphs:   [\x{2013}\x{2014}\x{1F680}\x{26A0}]
+```
+
+(Asterisk-box section dividers are NOT grepped - they are preferred.)
+
+## MANDATORY Self-Review Checklist
+
+Full checklists live in `.cursor/references/self-review.md`. Load it and run the relevant section before delivering.
+
+**STOP. Do NOT deliver code until you complete this review.**
+
+### Code Style Checklist
+- [ ] Zero `//` or `///` in the file (WHY: project rule, only `/* */` and `/** */` allowed)
+- [ ] Zero em or en dashes (U+2014, U+2013) anywhere (WHY: project rule, use hyphen / colon / rephrase)
+- [ ] File opens with `@file` + `@description` JSDoc header (WHY: enforced for docgen and author clarity)
+- [ ] Section dividers are asterisk-box `/*************** Name ***************/` (WHY: preferred project style)
+- [ ] Contract NatSpec has `@title`, `@notice`, `@dev`, and `@custom:security-contact` (WHY: OpenZeppelin / ethereum-lists convention)
+- [ ] Public / external functions have NatSpec `@notice @dev @param @return`, or `@inheritdoc ParentName` when implementing an interface (WHY: docgen + industry standard)
+- [ ] Inline comments explain WHY (non-obvious FHE constraint), not WHAT (WHY: noise dilutes real constraints)
+
+### Solidity Checklist
+- [ ] Pragma is `^0.8.28` (default), `^0.8.27`+ if importing `@openzeppelin/confidential-contracts`, or `^0.8.24` minimum if a lower pragma is explicitly required (WHY: 0.8.24 is the FHEVM minimum; 0.8.28 matches the reference template; OZ confidential ERC7984.sol declares `^0.8.27`)
+- [ ] Config `ZamaEthereumConfig` not `SepoliaConfig` (WHY: SepoliaConfig removed in v0.9)
+- [ ] Imports from `@fhevm/solidity/lib/FHE.sol` (WHY: only valid import path)
+- [ ] External inputs use `externalEuintXX` + `bytes calldata inputProof` (WHY: required for ZK proof)
+- [ ] Inputs converted with `FHE.fromExternal()` not `FHE.asEuintXX()` (WHY: asEuint converts literals only)
+- [ ] No `require()`/`if`/`assert` on encrypted values (WHY: `ebool` is a `bytes32` UDVT - direct use is a compile error; if dev unwraps the handle to a primitive, the non-zero handle always passes the check)
+- [ ] `FHE.allowThis()` after every stored encrypted computation (WHY: contract loses access next tx)
+- [ ] `FHE.allow(result, user)` for user-readable values (WHY: user cannot decrypt without ACL)
+- [ ] Comparison names: `ne` not `neq`, `le` not `lte`, `ge` not `gte` (WHY: wrong names don't exist)
+- [ ] Library `FHE.xxx()` not `TFHE.xxx()` (WHY: TFHE is the Rust lib, FHE is the Solidity API)
+- [ ] No `requestDecryption`, `GatewayCaller`, `FHE.allowForDecryption` (WHY: requestDecryption / GatewayCaller removed in v0.9; `FHE.allowForDecryption` never existed - use `FHE.makePubliclyDecryptable`)
+- [ ] Public decrypt: makePubliclyDecryptable -> publicDecrypt -> checkSignatures (WHY: v0.9 3-step flow)
+- [ ] `checkSignatures(bytes32[], bytes, bytes)` not `(uint256, bytes, bytes[])` (WHY: v0.9 signature)
+- [ ] Handle order in checkSignatures matches publicDecrypt order (WHY: cryptographically binding)
+- [ ] No signed `eint` types used (WHY: declared in `encrypted-types/EncryptedTypes.sol` so a bare `eint64 x;` compiles, but `@fhevm/solidity@0.11.1` ships zero `FHE.*` overloads - first operation fails with `Member "<op>" not found ... after argument-dependent lookup`)
+
+### Post-Delivery Grep (zero matches required)
+```
+Solidity: requestDecryption|SepoliaConfig|GatewayCaller|TFHE\.|FHE\.allowForDecryption\(|FHE\.neq\(|FHE\.lte\(|FHE\.gte\(|verifySignatures|zama\.cloud|FHE\.randBounded\(
+Style: ^\s*//[^\*]|^\s*///|[\x{2013}\x{2014}\x{1F680}\x{26A0}]
+```
+
+### Mechanical Lint (run after grep)
+```bash
+node .cursor/scripts/fhe-lint.js <path>
+# exit 0 clean, 1 DEFINITE, 2 LIKELY only
+```
+Findings cite `references/anti-patterns.md` IDs; treat non-zero exit as a delivery blocker.
+
+---
+
+## Common Runtime Errors -> Causes
+
+| Error / Symptom | Likely Cause | Fix |
+|----------------|-------------|-----|
+| Custom error `SenderNotAllowed(address)` (`ACL.sol:106`) | Missing `FHE.allow()` for the caller, or transient ACL expired because `FHE.allowThis()` was missing | Add `FHE.allow(value, msg.sender)` and/or `FHE.allowThis(value)` |
+| Custom error `ACLNotAllowed(bytes32, address)` (`FHEVMExecutor.sol:37`) | FHE op tried to read a handle the calling contract has no ACL on | Trace the missing `FHE.allowThis(handle)` step |
+| Custom error `SenderNotAllowedToUseHandle(bytes32, address)` (`FHE.sol:74 declaration; FHE.sol:8502 revert site`) | `FHE.fromExternal` Path 2 (no proof) on a handle the contract has no ACL on | Pass the original `inputProof` or grant transient ACL first |
+| Compile error `Member "div" not found ...` | Encrypted divisor passed to `FHE.div`/`FHE.rem` (no overload) | Restructure so the divisor is `uintN` plaintext |
+| Custom error `DivisionByZero()` (`FHEVMExecutor.sol:40`) | `FHE.div(x, 0)` or `FHE.rem(x, 0)` | Guard the plaintext divisor: `require(divisor != 0)` |
+| Custom error `NotPowerOfTwo()` (`FHEVMExecutor.sol:55`) | `FHE.randEuintX(upperBound)` with non-power-of-2 bound | Use a power-of-2 upperBound |
+| Custom error `KMSInvalidSigner(address)` (`KMSVerifier.sol:22`) OR `InvalidKMSSignatures()` (`FHE.sol:71 declaration; FHE.sol:9502 revert site`) | `FHE.checkSignatures` got cts/cleartexts in wrong order vs `publicDecrypt`, or KMS sig set below threshold. Runtime usually surfaces `KMSInvalidSigner` first (recovered address rejected); `InvalidKMSSignatures` is the FHE-library wrapper raised when `_verifySignatures` returns false. | Reorder cts/cleartexts to match the off-chain `publicDecrypt` exactly |
+| `EmptyInputProof` / `DeserializingInputProofFail` / `InvalidInputHandle` (`InputVerifier.sol`) | Wrong / stale `inputProof` paired with handle | Use `inputProof` from the same `instance.createEncryptedInput(...).encrypt()` call |
+| `EmptyDecryptionProof` / `DeserializingDecryptionProofFail` (`KMSVerifier.sol`) | `FHE.checkSignatures` received empty / malformed `decryptionProof` | Pass the raw `results.decryptionProof` from the relayer SDK |
+| Custom error `ZamaProtocolUnsupported()` (`ZamaConfig.sol:15`) | Inheriting `ZamaEthereumConfig` and deploying to a chain other than 1 / 11155111 / 31337 | Deploy to a supported chain or write a custom config base |
+| Custom error `HCUTransactionLimitExceeded()` / `HCUTransactionDepthLimitExceeded()` (`HCULimit.sol:22, 25`) | A single tx exceeded `MAX_HOMOMORPHIC_COMPUTE_UNITS_PER_TX = 20_000_000` total HCU or `MAX_HOMOMORPHIC_COMPUTE_UNITS_DEPTH_PER_TX = 5_000_000` sequential-depth HCU | Split work across txs, prefer `euint64`, budget with `fhevm.computeTransactionHCU(receipt)` |
+| Compile error "function not found" on FHE | Wrong function name (`neq`, `lte`, `TFHE.`) | Check exact name in operations table |
+
+---
+
+## Reference Files
+
+For detailed API reference, load from `.cursor/references/`:
+
+| File | When to Load |
+|------|-------------|
+| `types-operations.md` | Writing contracts with FHE operations |
+| `acl.md` | ACL patterns, grant/check access |
+| `inputs-decryption.md` | Input handling, all decryption flows |
+| `anti-patterns.md` | Reviewing code (all verified mistakes) |
+| `code-style.md` | Comment style, headers, dividers, NatSpec vs JSDoc, banned chars (applies to every file) |
+| `fhe-vulnerabilities.md` | Security audit (32 FHE-specific patterns P1-P32) |
+| `solidity-vulnerabilities.md` | General Solidity patterns (29 vectors G1-G29) |
+| `finding-validation.md` | Validating findings with 4-gate system |
+| `report-format.md` | Audit report template with ACL Coverage Matrix |
+| `erc7984.md` | ERC-7984 confidential tokens |
+| `testing.md` | Hardhat test patterns |
+| `frontend.md` | Browser SDK integration |
+| `deployment.md` | Deploy to Sepolia / mainnet (Hardhat only, Path A + Path B) |
+| `environment.md` | From-scratch Hardhat project scaffolding |
+| `self-review.md` | Mandatory pre-delivery checklist (Code Style + Solidity + Frontend + Hardhat) |
+| `templates/` | Ready-to-use contract templates |
+| `review-modules/` | 7 specialized hacking modules (6 FHE + 1 general) + `audit-protocol.md` (8 files total) |

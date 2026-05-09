@@ -1,0 +1,172 @@
+---
+description: "Zama FHEVM Hardhat test authoring and debugging. Applies to test files that import @fhevm/hardhat-plugin, use the 'fhevm' helper from 'hardhat', call fhevm.createEncryptedInput / userDecryptEuint / publicDecrypt, or reference FhevmType. Triggers also on 'mock fhevm', 'encrypted input test', and the test-side custom errors SenderNotAllowed, ACLNotAllowed, SenderNotAllowedToUseHandle, InvalidInputHandle, EmptyInputProof, DeserializingInputProofFail, InvalidKMSSignatures, KMSInvalidSigner, EmptyDecryptionProof, DivisionByZero, HCUTransactionLimitExceeded, HCUTransactionDepthLimitExceeded."
+globs: ["**/*.test.ts", "**/*.test.tsx", "**/*.test.js", "**/*.spec.ts", "**/*.spec.tsx", "**/test/**/*.ts", "**/test/**/*.tsx"]
+alwaysApply: false
+---
+
+# FHEVM Hardhat Testing Rules
+
+## Setup
+
+```typescript
+import { fhevm } from "hardhat";
+import { FhevmType } from "@fhevm/hardhat-plugin";
+```
+
+## Test Modes
+
+| Mode | Command | Encryption | Speed |
+|------|---------|-----------|-------|
+| Mock | `npx hardhat test` | Simulated | Fast |
+| Local node | `npx hardhat test --network localhost` | Simulated | Fast |
+| Sepolia | `npx hardhat test --network sepolia` | Real FHE | Slow |
+
+## Encrypting Values
+
+```typescript
+const input = fhevm.createEncryptedInput(contractAddress, signer.address);
+input.add64(1000n);
+const encrypted = await input.encrypt();
+/* encrypted.handles[0] - bytes32 handle (order matches add*() call order) */
+/* encrypted.inputProof - shared proof for all handles */
+```
+
+## Decrypt Functions - Three Different Signatures
+
+```typescript
+/* euint types - FhevmType IS REQUIRED */
+const val: bigint = await fhevm.userDecryptEuint(
+    FhevmType.euint64, handle, contractAddr, signer
+);
+
+/* ebool - NO FhevmType parameter */
+const flag: boolean = await fhevm.userDecryptEbool(
+    handle, contractAddr, signer
+);
+
+/* eaddress - NO FhevmType parameter */
+const addr: string = await fhevm.userDecryptEaddress(
+    handle, contractAddr, signer
+);
+```
+
+This is the #1 testing mistake: adding `FhevmType.ebool` to `userDecryptEbool` by analogy with euint.
+
+## Public Decrypt - Same Pattern
+
+```typescript
+const val = await fhevm.publicDecryptEuint(FhevmType.euint64, handle);
+const flag = await fhevm.publicDecryptEbool(handle);
+const addr = await fhevm.publicDecryptEaddress(handle);
+/* No signer or contractAddress needed */
+```
+
+## Custom Tasks
+
+Custom Hardhat tasks MUST call `await fhevm.initializeCLIApi()` before using the fhevm API.
+Tests auto-initialize - only tasks need this.
+
+## Never Use in Tests
+
+- `fhevmjs` - deprecated, use `@fhevm/hardhat-plugin`
+- `@fhevm/sdk` - does not exist
+- `fhevm.createInstance()` - exists on the implementation class but NOT on the public typed `HardhatFhevmRuntimeEnvironment` interface; use `fhevm.createEncryptedInput()` directly
+
+---
+
+## Workflow: Generate Tests
+
+When the user asks to write tests for an FHEVM contract:
+
+1. **Tier 1 preload** -> Read `.cursor/references/anti-patterns.md` (Hardhat mistakes #20-#22: FhevmType misuse, old fhevmjs)
+2. **Load testing guide** -> Read `.cursor/references/testing.md`
+3. **Verify the contract first** - run a quick review scan against all documented anti-patterns before writing tests:
+   - Check ACL completeness (`allowThis` + `allow` on all stored values)
+   - Check no branching on encrypted values
+   - Check correct function names (no `neq`, `lte`, `gte`)
+4. **Generate Hardhat test** - for each test, verify:
+   - Import `fhevm` from `hardhat` and `FhevmType` from `@fhevm/hardhat-plugin`
+   - `fhevm.createEncryptedInput()` for encryption
+   - `userDecryptEuint` takes `FhevmType` (WHY: it needs to know which euint size)
+   - `userDecryptEbool` does NOT take `FhevmType` (WHY: bool has no size variants)
+   - `userDecryptEaddress` does NOT take `FhevmType` (WHY: address has no size variants)
+   - Test happy path AND edge cases (insufficient balance, uninitialized, overflow)
+   - Verify encrypted state via decryption after each operation
+5. **2-Layer Verify**: re-read generated test, confirm every decrypt call matches the correct signature
+
+---
+
+## Code Style (enforced on every test file)
+
+- **No `//` or `///`.** All comments are block-style `/* */` or JSDoc `/** */`.
+- **No em or en dashes.** U+2014 (EM DASH) and U+2013 (EN DASH) are banned.
+  Use hyphen, colon, comma, parentheses, or rephrase.
+- **File header** - open every test file with `@file` + `@description`:
+
+  ```typescript
+  /**
+   * @file MyContract.test.ts
+   * @description Hardhat tests for MyContract: [what it covers].
+   */
+  ```
+
+- **Section dividers** are asterisk-bordered box comments, one line each:
+
+  ```typescript
+  /*************** Minting ***************/
+  /*************** Transfer ***************/
+  /*************** ACL Invariants ***************/
+  ```
+
+  At least 10 leading and 10 trailing `*`, Title Case label. Use one
+  divider per `describe` group if the file has more than two.
+
+- **Test helpers / exported fixtures** use JSDoc (NOT NatSpec - NatSpec is
+  Solidity-only). Leading description text plus `@param`, `@returns`,
+  `@throws`, `@example`, `@deprecated`, `@see`, `@remarks` (TSDoc). Never
+  `@notice`, `@dev`, `@inheritdoc`, or `@custom:*` in test files.
+
+  ```typescript
+  /**
+   * Encrypt a euint64 and mint it to `to` in one step.
+   *
+   * @param token The deployed ConfidentialERC20 instance.
+   * @param to Recipient signer.
+   * @param amount Cleartext amount, bigint.
+   * @returns The decrypted on-chain balance after the mint.
+   * @throws If the signer lacks minter permission.
+   */
+  async function mintAndRead(token, to, amount) { }
+  ```
+
+- **Inline comments** explain WHY, not WHAT: why this assertion enforces
+  a specific FHE invariant, why this handle order matters, why this edge
+  case would otherwise pass silently.
+
+---
+
+## Test Checklist
+- [ ] `userDecryptEuint` uses `FhevmType` param (WHY: needs to know euint bit width)
+- [ ] `userDecryptEbool` has NO `FhevmType` param (WHY: different function signature)
+- [ ] `userDecryptEaddress` has NO `FhevmType` param (WHY: different function signature)
+- [ ] Custom tasks call `fhevm.initializeCLIApi()` (WHY: tasks don't auto-initialize)
+- [ ] No `fhevmjs`, `@fhevm/sdk`, or `fhevm.createInstance()` imports
+- [ ] Zero `//` or `///` comments, block-style only (WHY: project rule)
+- [ ] Zero em / en dashes anywhere (WHY: project rule)
+- [ ] File opens with `@file` + `@description` JSDoc header (WHY: project rule)
+- [ ] Section dividers are asterisk-box `/*************** Name ***************/` (WHY: preferred project style)
+
+### Post-Delivery Grep (zero matches required)
+```
+FHEVM: userDecryptEbool\(FhevmType|userDecryptEaddress\(FhevmType|fhevmjs|@fhevm/sdk
+Style: ^\s*//[^\*]|^\s*///|[\x{2013}\x{2014}\x{1F680}\x{26A0}]
+```
+
+---
+
+## Reference Files
+
+For detailed testing patterns, load `.cursor/references/testing.md`.
+For full comment style, file headers, section dividers, JSDoc-vs-NatSpec
+tag reference, and banned characters, load `.cursor/references/code-style.md`.
+For the mandatory pre-delivery checklist (Hardhat section), load `.cursor/references/self-review.md`.

@@ -1,0 +1,56 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify tarball contents
+        run: npm pack --dry-run
+
+      - name: Assert dev/ is not packed
+        run: |
+          set -eu
+          npm pack --dry-run --json | node -e '
+            const pkg = JSON.parse(require("fs").readFileSync(0, "utf8"))[0];
+            const leaks = pkg.files.map(f => f.path).filter(p => p === "dev" || p.startsWith("dev/"));
+            if (leaks.length) {
+              console.error("dev/ paths leaked into tarball:");
+              for (const p of leaks) console.error("  " + p);
+              process.exit(1);
+            }
+            console.log("ok: 0 dev/ paths, " + pkg.files.length + " files total");
+          '
+
+      - name: Run tests
+        run: npm test
+
+      - name: Install tarball in a clean project
+        run: |
+          set -eux
+          npm pack
+          tgz=$(ls zama-skill-*.tgz | head -n1)
+          dir=$(mktemp -d)
+          cd "$dir"
+          npm init -y >/dev/null
+          npm install --no-save "$GITHUB_WORKSPACE/$tgz"
+          npx --no-install zama-skill --version
+          npx --no-install zama-skill claude --target ./out --dry-run
+
+      - name: Publish
+        run: npm publish --provenance --access public

@@ -1,0 +1,336 @@
+---
+description: "Zama FHEVM dApp / React / Next.js / Vite frontend, both the new @zama-fhe/sdk@^3.0.0 high-level SDK family (and @zama-fhe/react-sdk for React) and the legacy @zama-fhe/relayer-sdk primitives. Applies to .ts/.tsx/.js/.jsx files that import @zama-fhe/sdk, @zama-fhe/sdk/node, @zama-fhe/sdk/viem, @zama-fhe/sdk/ethers, @zama-fhe/sdk/cleartext, @zama-fhe/sdk/query, @zama-fhe/react-sdk, @zama-fhe/react-sdk/wagmi, @zama-fhe/relayer-sdk/web, /bundle, or /node; or that use ZamaSDK, ZamaProvider, RelayerWeb, RelayerNode, RelayerCleartext, ViemSigner, EthersSigner, WagmiSigner, GenericSigner, Token, ReadonlyToken, WrappersRegistry, indexedDBStorage, memoryStorage, asyncLocalStorage, chromeSessionStorage, matchZamaError, zamaQueryKeys, TOKEN_TOPICS, ACL_TOPICS; or call createInstance, initSDK, createEncryptedInput, userDecrypt, publicDecrypt, generateKeypair, createEIP712, shield, unshield, unshieldAll, confidentialTransfer, confidentialTransferFrom, balanceOf, delegateDecryption, decryptBalanceAs; or use any of the 59 React hooks (useShield, useUnshield, useUnshieldAll, useResumeUnshield, useConfidentialBalance, useConfidentialBalances, useConfidentialTransfer, useConfidentialTransferFrom, useConfidentialApprove, useConfidentialIsApproved, useAllow, useIsAllowed, useRevoke, useRevokeSession, useEncrypt, useUserDecrypt, usePublicDecrypt, useGenerateKeypair, useDelegateDecryption, useRevokeDelegation, useDelegationStatus, useDecryptBalanceAs, useBatchDecryptBalancesAs, useActivityFeed, useToken, useReadonlyToken, useMetadata, useUnderlyingAllowance, useWrapperDiscovery, useWrappersRegistryAddress, useListPairs, useTokenPair*, useConfidentialTokenAddress, useTokenAddress, useIsConfidentialTokenValid, useUnwrap, useUnwrapAll, useFinalizeUnwrap). Triggers also on COOP/COEP setup, WASM loading errors, mainnet API-key auth and backend-proxy patterns, Vite optimizeDeps tweaks, Next.js SSR, MV3 web extensions, and confidential ERC-7984 token flows."
+globs: []
+alwaysApply: false
+---
+
+# FHEVM Frontend SDK Rules
+
+## SDK Choice (NEW vs LEGACY)
+
+Two SDK families ship from npm; both are supported.
+
+- **New high-level SDK** (`@zama-fhe/sdk@^3.0.0` + `@zama-fhe/react-sdk@^3.0.0`,
+  `node >= 22`): use for confidential ERC-7984 dApps. Provides `ZamaSDK`
+  orchestrator, `Token` API (shield / unshield / confidentialTransfer /
+  balanceOf), session model with one-signature decrypt unlock,
+  `RelayerWeb` / `RelayerNode` / `RelayerCleartext`, signer adapters
+  (`ViemSigner` / `EthersSigner` / `WagmiSigner`), storage adapters,
+  delegated decryption, activity feeds, 59 React hooks. Detail in
+  `.cursor/references/zama-sdk-overview.md` and the other
+  `zama-sdk-*.md` files.
+- **Legacy primitive SDK** (`@zama-fhe/relayer-sdk@0.4.1` exact): use for
+  raw `createInstance` / `createEncryptedInput` / `createEIP712` against
+  custom non-ERC-7984 confidential contracts (voting, sealed auctions).
+  Still required as a transitive install for the contract toolchain.
+  This file's lower sections cover its surface.
+
+## Encrypt + Decrypt Quick Reference (new SDK)
+
+```ts
+/* Encrypt user input (browser, React) - "use client" required in Next.js */
+import { useEncrypt } from "@zama-fhe/react-sdk";
+const { mutateAsync: encrypt } = useEncrypt();
+const { handles, inputProof } = await encrypt({
+  values: [{ value: 1000n, type: "euint64" }],
+  contractAddress, userAddress,
+});
+
+/* Decrypt confidential token balance - one EIP-712 prompt, then silent. Returns bigint. */
+const balance = await token.balanceOf();
+const handle  = await token.confidentialBalanceOf();   /* raw bytes32 handle */
+import { useConfidentialBalance } from "@zama-fhe/react-sdk";
+const { data } = useConfidentialBalance({ tokenAddress: cUSDT });
+
+/* Decrypt arbitrary handles (custom contract) */
+await sdk.allow([contract.address]);
+const values = await sdk.userDecrypt([{ handle, contractAddress: contract.address }]);
+const cleartext = values[handle];   /* bare Record */
+
+/* Public decrypt (3-step bound flow) */
+import { usePublicDecrypt } from "@zama-fhe/react-sdk";
+const { mutateAsync: publicDecrypt } = usePublicDecrypt();
+const { clearValues } = await publicDecrypt({ handles: [handle] });
+```
+
+Pitfalls: `userDecrypt` returns a bare `Record`; `publicDecrypt` returns `{ clearValues }`. `NoCiphertextError` = "never shielded" (show empty state), NOT "0". COOP `same-origin` + COEP `require-corp` (or `credentialless` if using RainbowKit / WalletConnect). Vite: exclude `@zama-fhe/relayer-sdk` from `optimizeDeps` AND set `worker.format: "es"`. Mainnet: backend proxy with `x-api-key`, NEVER `NEXT_PUBLIC_*` / `VITE_*`. Detail: `.cursor/references/zama-sdk-tokens.md`, `zama-sdk-session.md`, `zama-sdk-react.md`, `zama-sdk-errors.md`.
+
+## Import - Sub-path Required
+
+```typescript
+/* CORRECT */
+import { createInstance, initSDK, SepoliaConfig } from '@zama-fhe/relayer-sdk/web';
+
+/* WRONG - bare import has no main export */
+import { createInstance } from '@zama-fhe/relayer-sdk';
+
+/* WRONG - package does not exist */
+import { createInstance } from '@fhevm/sdk';
+
+/* WRONG - deprecated */
+import { createInstance } from 'fhevmjs';
+```
+
+Sub-paths: `/web` (browser+bundler), `/bundle` (CDN), `/node` (Node.js).
+
+## Init and Instance
+
+```typescript
+await initSDK();   /* browser only - NOT initFhevm() */
+const instance = await createInstance({ ...SepoliaConfig, network: window.ethereum });
+```
+
+Browser requires COOP/COEP headers for WASM SharedArrayBuffer:
+`Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy: credentialless`
+
+**Default to `credentialless`.** `require-corp` blocks any cross-origin subresource that lacks a `Cross-Origin-Resource-Policy` header, which breaks RainbowKit / WalletConnect / wagmi (iframes, images, external scripts). Both values enable SharedArrayBuffer. Use `require-corp` only if you control every cross-origin resource and can serve them with CORP headers.
+
+## Encrypt
+
+```typescript
+const input = instance.createEncryptedInput(contractAddress, userAddress);
+input.add64(1000n);
+const encrypted = await input.encrypt();
+/* encrypted.handles: Uint8Array[] (NOT hex strings) */
+/* encrypted.inputProof: Uint8Array */
+```
+
+Handle order matches `add*()` call order. Max 2048 bits / 256 variables per input.
+
+## Public Decrypt
+
+```typescript
+const results = await instance.publicDecrypt([handle]);
+const val = results.clearValues[handle];  /* NOT results.values */
+```
+
+Return type: `{ clearValues: Record<hex, bigint|boolean|hex>, abiEncodedClearValues: hex, decryptionProof: hex }`
+
+## User Decrypt (EIP-712)
+
+```typescript
+const keypair = instance.generateKeypair();
+const eip712 = instance.createEIP712(keypair.publicKey, [contractAddr], startTs, days);
+const sig = await signer.signTypedData(eip712.domain, eip712.types, eip712.message);
+const clear = await instance.userDecrypt(
+    [{ handle, contractAddress }], keypair.privateKey, keypair.publicKey,
+    sig, [contractAddr], userAddr, startTs, days
+);
+/* userDecrypt returns bare Record - no .clearValues wrapper */
+```
+
+## SepoliaConfig Naming Collision
+
+`SepoliaConfig` in the relayer SDK is CORRECT - it bundles the current v0.11 Sepolia contract addresses (ACL `0xf0Ff...`, KMS `0xbE0E...`, InputVerifier `0xBBC1...`) and is what `createInstance` consumes.
+`SepoliaConfig` in Solidity (`@fhevm/solidity`) was REMOVED in v0.9 - use `ZamaEthereumConfig`.
+Same name, completely different things.
+
+## Vite Configuration
+
+```typescript
+/* vite.config.ts */
+export default defineConfig({
+  server: {
+    headers: {
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "credentialless",
+    },
+  },
+  optimizeDeps: {
+    exclude: ["@zama-fhe/relayer-sdk"],
+  },
+  worker: {
+    /* WASM workers must be ESM, otherwise the SDK's `new URL('*.wasm', import.meta.url)`
+       returns a path the bundler cannot resolve and you hit "expected magic word 00 61 73 6d". */
+    format: "es",
+  },
+});
+```
+
+## Next.js Configuration
+
+```javascript
+/* next.config.js */
+const nextConfig = {
+  async headers() {
+    return [{
+      source: "/(.*)",
+      headers: [
+        { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+        { key: "Cross-Origin-Embedder-Policy", value: "credentialless" },
+      ],
+    }];
+  },
+  webpack: (config) => {
+    config.resolve.fallback = { ...config.resolve.fallback, fs: false, net: false, tls: false };
+    return config;
+  },
+};
+```
+
+---
+
+## Mainnet: `MainnetConfig` + API Key Auth
+
+Zama mainnet launched Dec 30, 2025. Chain 1 requires a relayer API key (Zama-hosted) OR a self-hosted relayer.
+
+**Obtain key:** apply at https://forms.gle/jq84zEek1oiv3kBz9 (Zama reviews each request). Testnet integration MUST pass first.
+
+**Server / Node (use `auth` field):**
+```typescript
+import { createInstance, MainnetConfig } from '@zama-fhe/relayer-sdk/node';
+const instance = await createInstance({
+    ...MainnetConfig,
+    network: 'https://ethereum-rpc.publicnode.com',
+    auth: { __type: 'ApiKeyHeader', value: process.env.ZAMA_FHEVM_API_KEY! },
+});
+```
+
+**Browser - NEVER put the key in client code.** Route through a backend proxy that injects the `x-api-key` header. On the client, set `relayerUrl` to your proxy, OMIT `auth`, and set `relayerRouteVersion`:
+```typescript
+const instance = await createInstance({
+    ...MainnetConfig,
+    network: window.ethereum,
+    relayerUrl: 'https://your-backend.example.com/relayer/v1', /* include /v1 for upstream */
+    relayerRouteVersion: 1, /* REQUIRED for non-Zama URLs; matches upstream version */
+    /* no auth field - proxy handles it */
+});
+```
+
+The SDK only auto-detects v1/v2 from the URL path on hardcoded Zama bases. For any other URL it falls back to `defaultRelayerVersion: 2` (camelCase). Mainnet/testnet `/v1` returns snake_case -> `Invalid relayer response.` if the version is wrong.
+
+**Proxy requirements** (any of these missing -> broken in the browser):
+1. Forward method+path+body to `https://relayer.mainnet.zama.org`, inject `x-api-key: <KEY>` from a server-side env var (`trim()` + reject `/\s/` to catch paste artifacts).
+2. CORS: `Access-Control-Allow-Headers: content-type, zama-sdk-version, zama-sdk-name` (SDK sends both custom headers; missing them rejects preflight).
+3. Forward those same SDK headers to upstream (don't hardcode `content-type` only).
+4. Strip `content-encoding` and `content-length` from the upstream response before sending to the client. Node `fetch()` decodes gzip/br before `.arrayBuffer()`, so re-sending the encoding header causes `ERR_CONTENT_DECODING_FAILED`.
+
+Never expose the key via `NEXT_PUBLIC_*` / `VITE_*`. Full proxy code in `.cursor/references/frontend.md` § 5c.
+
+**`Auth` type (verified):** `Auth = BearerToken | ApiKeyHeader | ApiKeyCookie`. For Zama-hosted mainnet use `{ __type: 'ApiKeyHeader', value }` (header defaults to `x-api-key`).
+
+**If compromised:** email `support@zama.org` and rotate the key.
+
+**Common mistakes on mainnet:**
+- Using `SepoliaConfig` on chain 1 -> wrong gateway
+- Missing `auth` on server-side config -> `401 unauthorized`
+- Key shipped in `NEXT_PUBLIC_*` / `VITE_*` / bundled JS -> anyone can drain quota
+- Hardcoding `relayer.testnet.zama.org` in mainnet -> always spread `MainnetConfig`
+- Omitting `relayerRouteVersion` on a non-Zama proxy URL -> `Invalid relayer response.`
+- Proxy CORS allows only `content-type` -> preflight rejected (missing SDK headers)
+- Proxy copies upstream `content-encoding` -> `ERR_CONTENT_DECODING_FAILED`
+- API key with internal whitespace -> 401 despite being "set"
+
+---
+
+## Anti-Patterns to Avoid (from anti-patterns.md #15-#19c)
+
+Before writing ANY frontend code, be aware of these 7 verified mistakes:
+
+| #    | Anti-Pattern                                               | Correct                                                         | Severity |
+|------|------------------------------------------------------------|------------------------------------------------------------------|----------|
+| 15   | Bare `@zama-fhe/relayer-sdk` import                        | Use sub-path: `/web`, `/bundle`, or `/node`                     | HIGH     |
+| 16   | `initFhevm()`                                              | `initSDK()`                                                      | HIGH     |
+| 17   | `results.values[0]`                                        | `results.clearValues[handle]`                                    | HIGH     |
+| 18   | `@fhevm/sdk`                                               | `@zama-fhe/relayer-sdk`                                          | HIGH     |
+| 19   | Missing COOP/COEP headers                                  | Serve `same-origin` + `require-corp` (or `credentialless`)       | MEDIUM   |
+| 19b  | Vite `optimizeDeps` rewrites SDK WASM URL to a 404         | `optimizeDeps.exclude: ["@zama-fhe/relayer-sdk"]`, `worker.format: "es"` | HIGH |
+| 19c  | Next.js / Remix SSR: `ReferenceError: indexedDB is not defined` | `"use client"` + gate `initSDK` / `createInstance` behind `useEffect` | HIGH |
+
+Load the full list: `.cursor/references/anti-patterns.md`
+
+## Code Style (enforced on every TS / JS / TSX / JSX file)
+
+- **No `//` or `///`.** All comments are block-style `/* */` or JSDoc `/** */`.
+- **No em or en dashes.** U+2014 (EM DASH) and U+2013 (EN DASH) are banned.
+  Use hyphen, colon, comma, parentheses, or rephrase.
+- **File header** - open every source file with a JSDoc `@file` block:
+
+  ```typescript
+  /**
+   * @file encrypt.ts
+   * @description Browser-side encryption helpers for the counter dApp.
+   */
+  ```
+
+- **Section dividers** are asterisk-bordered box comments, one line each:
+
+  ```typescript
+  /*************** SDK Init ***************/
+  /*************** Encryption Helpers ***************/
+  /*************** Wallet Connector ***************/
+  ```
+
+  At least 10 leading and 10 trailing `*`, Title Case label.
+
+- **Exported functions / classes / hooks** carry a full JSDoc block.
+
+  JSDoc / TSDoc is NOT NatSpec. Do not use `@notice`, `@dev`, `@inheritdoc`,
+  or `@custom:*` in TypeScript - those are Solidity-only tags parsed by
+  the Solidity compiler. In TS / JS, the description is the leading text
+  (no tag), and you use standard JSDoc / TSDoc tags.
+
+  Standard tags: plain leading description, `@param`, `@returns`,
+  `@throws`, `@example`, `@deprecated`, `@see`, `@remarks` (TSDoc).
+
+  ```typescript
+  /**
+   * Encrypt a euint64 input bound to the given contract / user.
+   *
+   * Handle order matches the `add*()` call order - when passing to the
+   * contract, `handles[0]` corresponds to the first `add*()` call.
+   *
+   * @param contractAddr Destination contract (binds the proof).
+   * @param userAddr User the input is attributed to.
+   * @param amount Cleartext amount, bigint, fits in 64 bits.
+   * @returns `{ handle, proof }` - pass both to the contract call.
+   * @throws If `initSDK()` has not been awaited in the browser.
+   */
+  export async function encryptAmount(
+    contractAddr: `0x${string}`,
+    userAddr: `0x${string}`,
+    amount: bigint,
+  ): Promise<{ handle: Uint8Array; proof: Uint8Array }> { }
+  ```
+
+- **Inline comments** explain WHY, not WHAT. Spend them on non-obvious SDK
+  behavior: handle order, `clearValues` vs `values`, COOP / COEP
+  tradeoffs, Vite `optimizeDeps` WASM bug, `credentialless` vs
+  `require-corp` with wallet connectors.
+
+## Frontend Checklist
+
+- [ ] Import uses sub-path `/web`, `/bundle`, or `/node` (WHY: bare import fails, no main export)
+- [ ] Init is `initSDK()` not `initFhevm()` (WHY: initFhevm does not exist)
+- [ ] Result field `clearValues` not `values` (WHY: actual type uses clearValues)
+- [ ] COOP / COEP headers configured (WHY: WASM SharedArrayBuffer requires them)
+- [ ] No `fhevmjs` or `@fhevm/sdk` imports (WHY: deprecated / does not exist)
+- [ ] Zero `//` or `///` comments, block-style only (WHY: project rule)
+- [ ] Zero em / en dashes (WHY: project rule)
+- [ ] File opens with `@file` + `@description` JSDoc header (WHY: project rule)
+- [ ] Section dividers are asterisk-box `/*************** Name ***************/` (WHY: preferred project style)
+
+### Post-Delivery Grep (zero matches required)
+```
+FHEVM: from '@zama-fhe/relayer-sdk'[^/]|initFhevm|@fhevm/sdk|results\.values\[|fhevmjs|zama\.cloud
+Style: ^\s*//[^\*]|^\s*///|[\x{2013}\x{2014}\x{1F680}\x{26A0}]
+```
+
+---
+
+## Reference Files
+
+For detailed frontend patterns, load `.cursor/references/frontend.md`.
+For full comment style, file headers, section dividers, JSDoc-vs-NatSpec
+tag reference, and banned characters, load `.cursor/references/code-style.md`.
+For the mandatory pre-delivery checklist (Frontend section), load `.cursor/references/self-review.md`.
+
+New SDK reference files (`@zama-fhe/sdk@^3.0.0` + `@zama-fhe/react-sdk@^3.0.0`), load in this order on a new SDK task:
+
+1. `.cursor/references/zama-sdk-overview.md` - package map, `ZamaSDK` constructor, network presets, when to choose new vs legacy SDK.
+2. `.cursor/references/zama-sdk-auth-storage.md` - backend proxy + 3 `auth` shapes + CSRF, `RelayerWeb` / `RelayerNode` / `RelayerCleartext`, signer adapters, storage adapters, web extensions.
+3. `.cursor/references/zama-sdk-tokens.md` - `Token` / `ReadonlyToken`, shield / unshield (resumable two-phase) / `confidentialTransfer` / `balanceOf`, batch decrypt, operator approvals.
+4. `.cursor/references/zama-sdk-session.md` - session model (`keypairTTL` / `sessionTTL`), `allow` / `userDecrypt` / `revokeSession`, full delegated decryption API.
+5. `.cursor/references/zama-sdk-react.md` - `ZamaProvider`, 59 React hooks (TanStack Query), Next.js SSR, Vite, `zamaQueryKeys` cache control. Load only on React tasks.
+6. `.cursor/references/zama-sdk-errors.md` - 26 error classes (`ZamaError` base + 25 subclasses), `matchZamaError` pattern, recovery flows, "no balance" vs "zero balance".
+7. `.cursor/references/zama-sdk-activity.md` - activity feed pipeline, token + ACL event decoders, `WrappersRegistry`, contract builders, operator approvals, FHE artifact cache. Load only when building dashboards or custom event UIs.
